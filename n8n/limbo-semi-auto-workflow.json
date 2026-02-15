@@ -1,0 +1,740 @@
+{
+  "name": "Limbo Semi-Auto Session Manager",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual_trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "number": [
+            {
+              "name": "balance",
+              "value": 100
+            }
+          ],
+          "string": [
+            {
+              "name": "result",
+              "value": "loss"
+            },
+            {
+              "name": "otpCode",
+              "value": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "edit_fields",
+      "name": "Edit Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": false,
+        "values": {
+          "string": [
+            {
+              "name": "runtime.betProvider",
+              "value": "={{$env.BET_PROVIDER || 'generic_http'}}"
+            },
+            {
+              "name": "runtime.currency",
+              "value": "={{$env.BET_CURRENCY || 'CAD'}}"
+            },
+            {
+              "name": "runtime.mode",
+              "value": "={{$env.ENABLE_AUTO_BET === 'true' ? 'auto' : 'semi_auto'}}"
+            },
+            {
+              "name": "runtime.sessionId",
+              "value": "={{$execution.id}}"
+            },
+            {
+              "name": "runtime.authCode",
+              "value": "={{$json.otpCode || $env.BET_OTP_CODE || \"\"}}"
+            },
+            {
+              "name": "runtime.apiKey",
+              "value": "={{$env.BET_API_KEY || \"\"}}"
+            }
+          ],
+          "boolean": [
+            {
+              "name": "runtime.enableAutoBet",
+              "value": "={{$env.ENABLE_AUTO_BET === 'true'}}"
+            },
+            {
+              "name": "runtime.dryRun",
+              "value": "={{$env.AUTO_BET_DRY_RUN === 'true'}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "build_runtime_context",
+      "name": "Build Runtime Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        580,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Integrated 4-Layer Hybrid Model (Semi-Auto) =====\n// Layer 1: Fractional bankroll sizing (base 0.1% ~ 0.2% cap)\n// Layer 2: Streak-adaptive sizing (winning momentum / losing defense)\n// Layer 3: Drawdown regime control (Normal/Caution/Defense)\n// Layer 4: Session circuit breaker (TP/SL/max tries + 4-loss cooldown)\n\nconst TARGET_MULTIPLIER = 25;\nconst BASE_BET_PCT = 0.001;       // 0.1%\nconst MAX_BET_PCT = 0.002;        // 0.2% cap\nconst MIN_BET = 0.01;\n\nconst PROFIT_TARGET_PCT = 10;     // +10%\nconst STOP_LOSS_PCT = -7;         // -7%\nconst MAX_TRIES = 400;\nconst LOSS_STREAK_FOR_PAUSE = 4;\nconst COOLDOWN_MINUTES = 15;\n\nconst input = $json;\nconst balance = Number(input.balance);\nconst result = String(input.result || '').toLowerCase();\n\nconst runtime = input.runtime || {};\nconst betProvider = runtime.betProvider || 'generic_http';\nconst currency = runtime.currency || 'CAD';\nconst executionMode = runtime.mode || 'semi_auto';\nconst dryRun = Boolean(runtime.dryRun);\nconst authCode = runtime.authCode || '';\nconst apiKey = runtime.apiKey || '';\n\nif (!Number.isFinite(balance) || balance <= 0) {\n  throw new Error('balance는 0보다 큰 숫자여야 합니다.');\n}\nif (!['win', 'loss'].includes(result)) {\n  throw new Error('result는 \"win\" 또는 \"loss\" 여야 합니다.');\n}\n\nconst state = getWorkflowStaticData('global');\nif (!state.initialized) {\n  state.initialized = true;\n  state.startBalance = balance;\n  state.tries = 0;\n  state.streak = 0;         // +: win streak, -: loss streak\n  state.lossStreak = 0;\n  state.cooldownUntil = null;\n  state.history = [];       // rolling outcomes: 1=win,0=loss\n}\n\nstate.tries += 1;\n\nif (result === 'win') {\n  state.streak = state.streak > 0 ? state.streak + 1 : 1;\n  state.lossStreak = 0;\n  state.history.push(1);\n} else {\n  state.streak = state.streak < 0 ? state.streak - 1 : -1;\n  state.lossStreak += 1;\n  state.history.push(0);\n}\nif (state.history.length > 20) state.history = state.history.slice(-20);\n\nconst now = new Date();\nconst existingCooldown = state.cooldownUntil ? new Date(state.cooldownUntil) : null;\n\nconst pnl = balance - state.startBalance;\nconst pnlPct = (pnl / state.startBalance) * 100;\n\n// ---- Layer 3: drawdown regime ----\nlet regime = 'normal';\nlet regimeFactor = 1.0;\nif (pnlPct <= -4) {\n  regime = 'defense';\n  regimeFactor = 0.55;\n} else if (pnlPct <= -2) {\n  regime = 'caution';\n  regimeFactor = 0.75;\n}\n\n// ---- Layer 2: streak-adaptive factor ----\nlet streakFactor = 1.0;\nif (state.streak >= 2) {\n  streakFactor = Math.min(1.25, 1 + (state.streak - 1) * 0.05); // mild increase on momentum\n} else if (state.streak <= -2) {\n  streakFactor = Math.max(0.5, 1 - (Math.abs(state.streak) - 1) * 0.12); // stronger defense on losses\n}\n\n// recent hit rate factor (last up to 10)\nconst recent = state.history.slice(-10);\nconst recentHit = recent.length ? recent.reduce((a,b)=>a+b,0) / recent.length : 0.5;\nlet hitRateFactor = 1.0;\nif (recentHit < 0.4) hitRateFactor = 0.75;\nif (recentHit > 0.6) hitRateFactor = 1.1;\n\n// ---- Layer 1 + 2 + 3 integration ----\nconst baseBet = balance * BASE_BET_PCT;\nlet nextBetRaw = baseBet * streakFactor * regimeFactor * hitRateFactor;\nnextBetRaw = Math.min(nextBetRaw, balance * MAX_BET_PCT);\nconst nextBet = Math.max(MIN_BET, Number(nextBetRaw.toFixed(2)));\n\n// ---- Layer 4: circuit breaker ----\nlet action = 'BET';\nlet reason = 'hybrid_continue';\n\nif (state.tries >= MAX_TRIES) {\n  action = 'STOP';\n  reason = 'max_tries_reached';\n} else if (pnlPct >= PROFIT_TARGET_PCT) {\n  action = 'STOP';\n  reason = 'take_profit_reached';\n} else if (pnlPct <= STOP_LOSS_PCT) {\n  action = 'STOP';\n  reason = 'stop_loss_reached';\n} else if (existingCooldown && existingCooldown > now) {\n  action = 'PAUSE';\n  reason = 'cooldown_active';\n} else if (state.lossStreak >= LOSS_STREAK_FOR_PAUSE) {\n  const cooldown = new Date(now.getTime() + COOLDOWN_MINUTES * 60 * 1000);\n  state.cooldownUntil = cooldown.toISOString();\n  action = 'PAUSE';\n  reason = '4_losses_cooldown';\n  state.lossStreak = 0;\n} else {\n  state.cooldownUntil = null;\n}\n\nreturn [{\n  action,\n  reason,\n  executionMode,\n  betProvider,\n  currency,\n  dryRun,\n  authCode,\n  apiKey,\n  model: {\n    name: 'hybrid_4layer_profit_survival',\n    regime,\n    factors: {\n      streakFactor: Number(streakFactor.toFixed(3)),\n      regimeFactor: Number(regimeFactor.toFixed(3)),\n      hitRateFactor: Number(hitRateFactor.toFixed(3)),\n      recentHitRate: Number((recentHit * 100).toFixed(1))\n    }\n  },\n  next: {\n    bet: nextBet,\n    multiplier: TARGET_MULTIPLIER\n  },\n  pnl: Number(pnl.toFixed(2)),\n  pnlPct: Number(pnlPct.toFixed(2)),\n  streak: state.streak,\n  tries: state.tries,\n  cooldownUntil: state.cooldownUntil,\n  balance,\n  result,\n  timestamp: now.toISOString()\n}];"
+      },
+      "id": "strategy_code",
+      "name": "Code",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.action}}",
+              "operation": "equal",
+              "value2": "PAUSE"
+            }
+          ]
+        }
+      },
+      "id": "if_pause",
+      "name": "IF (PAUSE?)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "specificTime",
+        "dateTime": "={{$json.cooldownUntil}}"
+      },
+      "id": "wait_cooldown",
+      "name": "Wait (Cooldown)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1160,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "webhookUri": "={{$env.DISCORD_WEBHOOK_URL}}",
+        "content": "=🧩 Limbo Session Update\nAction: {{$json.action}}\nReason: {{$json.reason}}\nMode: {{$json.executionMode}} / Provider: {{$json.betProvider}} / DryRun: {{$json.dryRun}}\nModel: {{$json.model.name}} / {{$json.model.regime}}\nBalance: {{$json.balance}} {{$json.currency}}\nPnL: {{$json.pnl}} {{$json.currency}} ({{$json.pnlPct}}%)\nStreak: {{$json.streak}}\nTries: {{$json.tries}}/400\nNext Bet: {{$json.next.bet}} {{$json.currency}} @ x{{$json.next.multiplier}}\nFactors: S {{$json.model.factors.streakFactor}}, R {{$json.model.factors.regimeFactor}}, H {{$json.model.factors.hitRateFactor}}\nCooldown Until: {{$json.cooldownUntil || '-'}}\nTime: {{$json.timestamp}}"
+      },
+      "id": "discord_notify_pause",
+      "name": "Discord (PAUSE)",
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "webhookUri": "={{$env.DISCORD_WEBHOOK_URL}}",
+        "content": "=🧩 Limbo Session Update\nAction: {{$json.action}}\nReason: {{$json.reason}}\nMode: {{$json.executionMode}} / Provider: {{$json.betProvider}} / DryRun: {{$json.dryRun}}\nModel: {{$json.model.name}} / {{$json.model.regime}}\nBalance: {{$json.balance}} {{$json.currency}}\nPnL: {{$json.pnl}} {{$json.currency}} ({{$json.pnlPct}}%)\nStreak: {{$json.streak}}\nTries: {{$json.tries}}/400\nNext Bet: {{$json.next.bet}} {{$json.currency}} @ x{{$json.next.multiplier}}\nFactors: S {{$json.model.factors.streakFactor}}, R {{$json.model.factors.regimeFactor}}, H {{$json.model.factors.hitRateFactor}}\nCooldown Until: {{$json.cooldownUntil || '-'}}\nTime: {{$json.timestamp}}"
+      },
+      "id": "discord_notify",
+      "name": "Discord (BET/STOP)",
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.GSHEET_DOC_ID}}",
+        "sheetName": "session_log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{$json.timestamp}}",
+            "action": "={{$json.action}}",
+            "reason": "={{$json.reason}}",
+            "balance": "={{$json.balance}}",
+            "result": "={{$json.result}}",
+            "pnl": "={{$json.pnl}}",
+            "pnlPct": "={{$json.pnlPct}}",
+            "streak": "={{$json.streak}}",
+            "tries": "={{$json.tries}}",
+            "nextBet": "={{$json.next.bet}}",
+            "nextMultiplier": "={{$json.next.multiplier}}",
+            "cooldownUntil": "={{$json.cooldownUntil || ''}}",
+            "modelName": "={{$json.model.name}}",
+            "regime": "={{$json.model.regime}}",
+            "streakFactor": "={{$json.model.factors.streakFactor}}",
+            "regimeFactor": "={{$json.model.factors.regimeFactor}}",
+            "hitRateFactor": "={{$json.model.factors.hitRateFactor}}",
+            "recentHitRate": "={{$json.model.factors.recentHitRate}}",
+            "executionMode": "={{$json.executionMode}}",
+            "betProvider": "={{$json.betProvider}}",
+            "currency": "={{$json.currency}}",
+            "dryRun": "={{$json.dryRun}}",
+            "otpProvided": "={{$json.authCode ? true : false}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "log_sheet_pause",
+      "name": "Log (Google Sheets, PAUSE)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1600,
+        200
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.GSHEET_DOC_ID}}",
+        "sheetName": "session_log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{$json.timestamp}}",
+            "action": "={{$json.action}}",
+            "reason": "={{$json.reason}}",
+            "balance": "={{$json.balance}}",
+            "result": "={{$json.result}}",
+            "pnl": "={{$json.pnl}}",
+            "pnlPct": "={{$json.pnlPct}}",
+            "streak": "={{$json.streak}}",
+            "tries": "={{$json.tries}}",
+            "nextBet": "={{$json.next.bet}}",
+            "nextMultiplier": "={{$json.next.multiplier}}",
+            "cooldownUntil": "={{$json.cooldownUntil || ''}}",
+            "modelName": "={{$json.model.name}}",
+            "regime": "={{$json.model.regime}}",
+            "streakFactor": "={{$json.model.factors.streakFactor}}",
+            "regimeFactor": "={{$json.model.factors.regimeFactor}}",
+            "hitRateFactor": "={{$json.model.factors.hitRateFactor}}",
+            "recentHitRate": "={{$json.model.factors.recentHitRate}}",
+            "executionMode": "={{$json.executionMode}}",
+            "betProvider": "={{$json.betProvider}}",
+            "currency": "={{$json.currency}}",
+            "dryRun": "={{$json.dryRun}}",
+            "otpProvided": "={{$json.authCode ? true : false}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "log_sheet",
+      "name": "Log (Google Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1380,
+        420
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.action === 'BET' && $env.ENABLE_AUTO_BET === 'true' && ($env.AUTO_BET_DRY_RUN === 'true' || (!!$env.BET_API_URL && !!$json.apiKey))}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "if_bet_auto",
+      "name": "IF (BET + Auto Enabled?)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.BET_API_URL}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$json.apiKey || $env.BET_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-OTP-Code",
+              "value": "={{$json.authCode || \"\"}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"amount\": {{$json.next.bet}},\n  \"multiplier\": {{$json.next.multiplier}},\n  \"currency\": \"{{$json.currency}}\",\n  \"clientRef\": \"{{$json.executionMode}}-{{$json.tries}}-{{$json.timestamp}}\",\n  \"meta\": {\n    \"model\": \"{{$json.model.name}}\",\n    \"regime\": \"{{$json.model.regime}}\",\n    \"reason\": \"{{$json.reason}}\",\n    \"provider\": \"{{$json.betProvider}}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "execute_bet_api",
+      "name": "Execute Bet API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        420
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{$json.betProvider}}",
+        "rules": [
+          {
+            "operation": "equal",
+            "value2": "generic_http"
+          }
+        ],
+        "fallbackOutput": 1
+      },
+      "id": "switch_bet_provider",
+      "name": "Switch Bet Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1260,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.dryRun === true}}",
+              "operation": "isTrue"
+            }
+          ]
+        }
+      },
+      "id": "if_dry_run",
+      "name": "IF (Dry Run?)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1460,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": false,
+        "values": {
+          "string": [
+            {
+              "name": "action",
+              "value": "STOP"
+            },
+            {
+              "name": "reason",
+              "value": "unsupported_bet_provider"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mark_unsupported_provider",
+      "name": "Mark Unsupported Provider",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1460,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": false,
+        "values": {
+          "string": [
+            {
+              "name": "reason",
+              "value": "dry_run_skip_api"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mark_dry_run",
+      "name": "Mark Dry Run",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1660,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ (() => { const r = $json; if (r.success === true) return 'success'; const s = String(r.status || r.result || r.state || '').toLowerCase(); if (['ok','success','placed','accepted','done'].includes(s)) return 'success'; if (r.id || r.betId || r.orderId || r.transactionId) return 'success'; return 'fail'; })() }}",
+              "operation": "equal",
+              "value2": "success"
+            }
+          ]
+        }
+      },
+      "id": "if_api_success",
+      "name": "IF (API Success?)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": false,
+        "values": {
+          "string": [
+            {
+              "name": "action",
+              "value": "STOP"
+            },
+            {
+              "name": "reason",
+              "value": "api_bet_failed_or_unknown_response"
+            },
+            {
+              "name": "apiStatus",
+              "value": "failed"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mark_api_failed",
+      "name": "Mark API Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1780,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": false,
+        "values": {
+          "string": [
+            {
+              "name": "reason",
+              "value": "api_bet_success"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mark_api_success",
+      "name": "Mark API Success",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1780,
+        340
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Build Runtime Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "IF (PAUSE?)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF (PAUSE?)": {
+      "main": [
+        [
+          {
+            "node": "Wait (Cooldown)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF (BET + Auto Enabled?)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (Cooldown)": {
+      "main": [
+        [
+          {
+            "node": "Discord (PAUSE)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discord (PAUSE)": {
+      "main": [
+        [
+          {
+            "node": "Log (Google Sheets, PAUSE)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discord (BET/STOP)": {
+      "main": [
+        [
+          {
+            "node": "Log (Google Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF (BET + Auto Enabled?)": {
+      "main": [
+        [
+          {
+            "node": "Switch Bet Provider",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Discord (BET/STOP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Bet API": {
+      "main": [
+        [
+          {
+            "node": "IF (API Success?)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Runtime Context": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Bet Provider": {
+      "main": [
+        [
+          {
+            "node": "IF (Dry Run?)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Unsupported Provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF (Dry Run?)": {
+      "main": [
+        [
+          {
+            "node": "Mark Dry Run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Execute Bet API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Dry Run": {
+      "main": [
+        [
+          {
+            "node": "Discord (BET/STOP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Unsupported Provider": {
+      "main": [
+        [
+          {
+            "node": "Discord (BET/STOP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF (API Success?)": {
+      "main": [
+        [
+          {
+            "node": "Mark API Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark API Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark API Success": {
+      "main": [
+        [
+          {
+            "node": "Discord (BET/STOP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark API Failed": {
+      "main": [
+        [
+          {
+            "node": "Discord (BET/STOP)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
